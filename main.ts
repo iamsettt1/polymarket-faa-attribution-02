@@ -61,7 +61,8 @@ const POOL_NORM_GATE = 240; // normalise only when the target's window holds at 
 const REGIME_MIN = 120; // minutes of step history in the short vol window
 const REGIME_LO = 0.6; // clamp for the vol-regime multiplier
 const REGIME_HI = 1.3;
-const GRID_H = [1, 2, 3, 4, 5, 6, 8, 10, 13, 16, 20, 25, 32, 40, 50, 63, 79, 100, 126, 158, 199, 240];
+const HORIZON_MINUTES = 240; // forecast horizon — the grid's last point is the full 4 hours ahead
+const GRID_H = [1, 2, 3, 4, 5, 6, 8, 10, 13, 16, 20, 25, 32, 40, 50, 63, 79, 100, 126, 158, 199, HORIZON_MINUTES];
 
 interface CaseMarket { id: string; prices: number[]; }
 interface Case { horizon_minutes: number; quantiles: number[]; markets: CaseMarket[]; }

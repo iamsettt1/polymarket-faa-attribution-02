@@ -45,6 +45,7 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 const QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95];
 const Z = [-1.644854, -0.67449, 0, 0.67449, 1.644854];
 const BASE_SIGMA = 0.0025;
+const MIN_HISTORY = 50; // below this many prices, a market gets the plain normal fallback
 
 const WARMUP_MIN = 480; // opening minutes never used as change-sample starts
 const RECENT_MIN = 720; // change samples start within the last 12 hours
@@ -157,7 +158,7 @@ function forecastMarket(m: CaseMarket, horizon: number, pool: PoolSrc[] | null, 
   const p = Float64Array.from(m.prices);
   const n = p.length;
   const x = p[n - 1];
-  if (n < 50) {
+  if (n < MIN_HISTORY) {
     const rows: number[][] = [];
     for (let h = 1; h <= horizon; h++) rows.push(Z.map((z) => round6(clamp01(x + z * BASE_SIGMA * Math.sqrt(h)))));
     return rows;

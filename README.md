@@ -4,7 +4,16 @@
 [![rank](https://make.fun/badge/polymarket-faa-attribution-02/iamsettt1/polymarket-faa-attribution-02/rank.svg)](https://make.fun/bounty/polymarket-faa-attribution-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=polymarket-faa-attribution-02)
 [![reward](https://make.fun/badge/polymarket-faa-attribution-02/iamsettt1/polymarket-faa-attribution-02/reward.svg)](https://make.fun/bounty/polymarket-faa-attribution-02?utm_source=github&utm_medium=readme&utm_campaign=polymarket-faa-attribution-02)
 
-Finch: quantile forecaster for the FAA outage attribution markets. Persistence median with each market's own empirical h-step change quantiles (last 12h, opening minutes excluded), vol-normalised pooling across the case's markets for thin histories, a short-window volatility-regime multiplier and widened outer tails. Deterministic, offline, Node standard library only. Local backtest on the kit's practice cases: pinball loss 0.2900 vs the house baseline's 0.3636.
+An empirical-quantile forecaster for Polymarket's FAA outage attribution markets. For each
+market in a case, the program studies how that market's Yes price actually moved over its
+recent history — every (start minute, horizon) pair contributes one move, standardised by
+sqrt(horizon) — and turns the empirical distribution of those moves into the five forecast
+quantiles (0.05, 0.25, 0.5, 0.75, 0.95) for each of the next 240 minutes. The median is
+pinned to the last observed price; markets with thin history borrow the pooled,
+volatility-normalised move distribution of the case's other markets; spreads are shaped by
+a spread scale, an extra widening of the outer quantiles, and a clamped volatility-regime
+factor comparing the last hour's volatility with the window's. Node 22, standard library
+only, fully offline and deterministic.
 
 ## Run it
 

@@ -1,40 +1,33 @@
-// polymarket-faa-attribution-02: quantile forecaster for Polymarket Yes prices.
+// polymarket-faa-attribution-02 — empirical-quantile forecaster (Node 22, standard library only).
 //
-// What the data says (all of it visible in any case's own 72 hours):
-//   - These prices are sticky: most minutes do not move at all, then a tick,
-//     then now and then a jump. The best median forecast is the last price
-//     itself; a median built from past drift only chases noise.
-//   - The honest spread is each market's own: the distribution of its h-step
-//     price changes over recent history. A fixed sigma for every market (the
-//     house baseline's 0.0025) is far too wide for the quiet markets and too
-//     narrow for the jumpy ones.
-//   - Volatility clusters and decays: changes from the last 12 hours describe
-//     the next 4 far better than changes from three days ago, and even they
-//     overstate it, so the empirical offsets are scaled by 0.65 and nudged by
-//     the ratio of the last 2 hours' step volatility to the window's. The two
-//     outer quantiles get a further 1.15 tail widening: the loss in these
-//     markets lives in rare jumps, and the tails are where a jump is paid for.
-//   - The median offset is pinned to exactly 0: the empirical median change,
-//     shrunk or not, is drift noise around the persistence centre.
-//   - A market's first minutes are price discovery (it opens at 0.5 and falls
-//     to its level), so the first 480 minutes are never used as sample starts.
-//   - A market with little usable history borrows the case's other markets'
-//     changes, and one with almost none falls back to a normal random-walk
-//     term from its own step volatility, then to the house sigma. Borrowed
-//     changes are first rescaled into the borrowing market's own volatility
-//     units (source changes x own step-RMS / source step-RMS, the ratio
-//     clamped to [1/2, 2]): the pooled distribution's shape — its fat atom at
-//     zero and its jump tails — is shared, but its width is not, and feeding
-//     a quiet market the raw changes of a jumpy one (or the reverse) was the
-//     single largest error source in v1's backtests. Normalisation applies
-//     only when the borrowing market's own window holds at least 240 steps;
-//     below that its volatility estimate is itself noise, so it borrows raw.
-//     In the final this matters doubly: the family has only four markets, all
-//     young, all driven by the same news, so pooled jump tails are the best
-//     evidence any one of them has about its own next four hours.
+// What it does
+// ------------
+// For every market in a case it looks at how that market's Yes price has actually moved in the
+// recent past, minute to horizon, and turns the empirical distribution of those moves into the
+// five forecast quantiles for each of the next `horizon_minutes` minutes:
 //
-// The forecast is a deterministic function of the input file: no clock, no
-// randomness, no network, standard library only.
+//   * Moves are studied in "return space": a move over h minutes is divided by sqrt(h), because
+//     the spread of a wandering price grows with the square root of time. Every (start minute,
+//     horizon) pair in the history window contributes one standardised move, so a market's whole
+//     window becomes a single sample of per-root-minute moves.
+//   * The forecast for horizon h takes the empirical quantiles of that sample, recentres them on
+//     the sample median, and scales them back up by sqrt(h). The median itself is pinned to the
+//     last observed price: the crowd's current price is the centre of the forecast.
+//   * A market whose own history is thin borrows strength from its siblings: every market's
+//     standardised moves are divided by that market's own volatility, pooled into one
+//     unit-volatility sample, and the pooled quantiles are re-scaled by the borrowing market's
+//     volatility.
+//   * Spreads are shaped before use: offsets from the median are multiplied by SPREAD_SCALE,
+//     the two outer quantiles (5% and 95%) are pushed a further OUTER_SCALE wider, and the whole
+//     spread is multiplied by a volatility-regime factor — the ratio of the last hour's
+//     volatility to the window's, clamped to [0.6, 1.3] — so a market that has just woken up
+//     gets a wider fan than one that has gone quiet.
+//   * Every value is clamped to [0, 1], each row is kept non-decreasing, and numbers are rounded
+//     to 6 decimals. The program is deterministic: two runs on the same case write the same bytes.
+//
+// Input and output follow the contest contract: read every `<id>.in` in $MAKEFUN_INPUT_DIR
+// (else /input), write `<id>.out` — {"forecasts":[{"id","q"}]} — to $MAKEFUN_OUTPUT_DIR
+// (else /output).
 
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -42,181 +35,193 @@ import { join } from 'node:path';
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
+/** The quantile levels the contest scores, in the order each output row lists them. */
 const QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95];
-const Z = [-1.644854, -0.67449, 0, 0.67449, 1.644854];
-const BASE_SIGMA = 0.0025;
-const MIN_HISTORY = 50; // below this many prices, a market gets the plain normal fallback
+/** Offsets from the median are multiplied by this before they become a forecast. */
+const SPREAD_SCALE = 0.65;
+/** The outer pair of quantiles (0.05 and 0.95) is widened by this extra factor. */
+const OUTER_SCALE = 1.15;
+/** Minutes of history the empirical move sample is built from (the recent 12 hours). */
+const HISTORY_MINUTES = 720;
+/** A market with fewer minutes of history than this forecasts from the pooled sample instead. */
+const THIN_MINUTES = 720;
+/** Minutes at the end of the window whose volatility defines the current regime. */
+const RECENT_MINUTES = 60;
+/** The regime multiplier (recent volatility / window volatility) is clamped to this band. */
+const REGIME_FLOOR = 0.6;
+const REGIME_CEIL = 1.3;
 
-const WARMUP_MIN = 480; // opening minutes never used as change-sample starts
-const RECENT_MIN = 720; // change samples start within the last 12 hours
-const SAMPLE_CAP = 2500; // max change samples per horizon (stride-sampled)
-const MIN_SAMPLES = 30; // below this, a horizon uses the normal fallback term
-const SPREAD_SCALE = 0.65; // shrink empirical offsets toward the median
-const OUTER_SCALE = 1.15; // extra widening on the q05/q95 offsets only
-const POOL_BELOW = 1500; // markets with fewer own samples borrow pooled changes
-const POOL_FRAC = 0.75; // pooled share of the mixture when borrowing
-const POOL_CAP = 2500; // max pooled samples taken per source market
-const POOL_NORM_CLAMP = 2; // pooled changes rescaled by own/source step-RMS, ratio clamped to [1/2, 2]
-const POOL_NORM_GATE = 240; // normalise only when the target's window holds at least this many steps
-const REGIME_MIN = 120; // minutes of step history in the short vol window
-const REGIME_LO = 0.6; // clamp for the vol-regime multiplier
-const REGIME_HI = 1.3;
-const HORIZON_MINUTES = 240; // forecast horizon — the grid's last point is the full 4 hours ahead
-const GRID_H = [1, 2, 3, 4, 5, 6, 8, 10, 13, 16, 20, 25, 32, 40, 50, 63, 79, 100, 126, 158, 199, HORIZON_MINUTES];
+interface CaseMarket {
+  id: string;
+  prices: number[];
+}
 
-interface CaseMarket { id: string; prices: number[]; }
-interface Case { horizon_minutes: number; quantiles: number[]; markets: CaseMarket[]; }
-interface PoolSrc { p: Float64Array; firstStart: number; }
+interface Case {
+  horizon_minutes: number;
+  quantiles: number[];
+  markets: CaseMarket[];
+}
 
-const clamp01 = (v: number): number => (v < 0 ? 0 : v > 1 ? 1 : v);
-const round6 = (v: number): number => Math.round(v * 1e6) / 1e6 + 0;
+/** Round to 6 decimals after clamping into [0, 1]; the +0 turns a rounded -0 into 0. */
+const price6 = (x: number): number => Math.round(Math.min(1, Math.max(0, x)) * 1e6) / 1e6 + 0;
 
-/** Quantile of a sorted Float64Array, linear interpolation (type 7). */
-function quantileOf(sorted: Float64Array, tau: number): number {
-  const m = sorted.length;
-  if (m === 0) return 0;
-  if (m === 1) return sorted[0];
-  const pos = tau * (m - 1);
+/** The tau-quantile of an ascending-sorted sample, linearly interpolated between neighbours. */
+function sampleQuantile(sorted: number[], tau: number): number {
+  if (sorted.length === 0) return 0;
+  if (sorted.length === 1) return sorted[0] as number;
+  const pos = tau * (sorted.length - 1);
   const lo = Math.floor(pos);
+  const hi = Math.min(lo + 1, sorted.length - 1);
   const frac = pos - lo;
-  return lo + 1 < m ? sorted[lo] + frac * (sorted[lo + 1] - sorted[lo]) : sorted[lo];
+  return (sorted[lo] as number) * (1 - frac) + (sorted[hi] as number) * frac;
 }
 
-/** First usable sample start: warmup and recency both applied. */
-function firstStartOf(n: number): number {
-  return Math.max(0, Math.min(WARMUP_MIN, n - 2), n - RECENT_MIN);
-}
-
-/** H-step changes of one series, starts in [firstStart, n-1-H], stride-capped. */
-function collectChanges(p: Float64Array, firstStart: number, H: number, cap: number): Float64Array {
-  const n = p.length;
-  const count = n - 1 - H - firstStart + 1;
-  if (count <= 0) return new Float64Array(0);
-  const stride = Math.max(1, Math.floor(count / cap));
-  const s = new Float64Array(Math.ceil(count / stride));
-  let w = 0;
-  for (let i = firstStart; i <= n - 1 - H; i += stride) s[w++] = p[i + H] - p[i];
-  return s.subarray(0, w);
-}
-
-/** RMS of a series' 1-step changes over [from, len-1). */
-function stepRms(p: Float64Array, from: number): number {
-  let ss = 0, c = 0;
-  for (let i = from; i < p.length - 1; i++) { const d = p[i + 1] - p[i]; ss += d * d; c++; }
-  return c ? Math.sqrt(ss / c) : 0;
-}
-
-/** The five quantile offsets of the price change at one grid horizon. */
-function horizonOffsets(p: Float64Array, firstStart: number, H: number, sigma: number, pool: PoolSrc[] | null, self: Float64Array): number[] {
-  const own = collectChanges(p, firstStart, H, SAMPLE_CAP);
-  let used = own;
-  if (pool && own.length < POOL_BELOW) {
-    const parts: Float64Array[] = [own];
-    let poolLen = 0;
-    // Rescale borrowed changes into this market's volatility units, but only
-    // when this market's own window is long enough to trust its step-RMS.
-    const norm = p.length - 1 - firstStart >= POOL_NORM_GATE && sigma > 0;
-    for (const src of pool) {
-      if (src.p === self) continue;
-      let c = collectChanges(src.p, src.firstStart, H, POOL_CAP);
-      if (norm) {
-        const sSig = stepRms(src.p, src.firstStart);
-        if (sSig > 0) {
-          const f = Math.min(POOL_NORM_CLAMP, Math.max(1 / POOL_NORM_CLAMP, sigma / sSig));
-          if (f !== 1) {
-            const cc = new Float64Array(c.length);
-            for (let i = 0; i < c.length; i++) cc[i] = c[i] * f;
-            c = cc;
-          }
-        }
-      }
-      parts.push(c);
-      poolLen += c.length;
-    }
-    const take = Math.min(poolLen, Math.round((own.length * POOL_FRAC) / (1 - POOL_FRAC)));
-    if (take > 0) {
-      const all = parts.reduce((a, b) => a + b.length, 0);
-      const merged = new Float64Array(all);
-      let off = 0;
-      for (const part of parts) { merged.set(part, off); off += part.length; }
-      // own samples first, then a stride through the rest of the pool
-      const rest = merged.subarray(own.length);
-      const stride = Math.max(1, Math.floor(rest.length / take));
-      const mixed = new Float64Array(own.length + Math.ceil(rest.length / stride));
-      mixed.set(own, 0);
-      let w = own.length;
-      for (let i = 0; i < rest.length; i += stride) mixed[w++] = rest[i];
-      used = mixed.subarray(0, w);
-    }
+/** Population standard deviation; 0 for a sample of fewer than two values. */
+function stdDev(xs: number[]): number {
+  if (xs.length < 2) return 0;
+  let mean = 0;
+  for (const x of xs) mean += x;
+  mean /= xs.length;
+  let acc = 0;
+  for (const x of xs) {
+    const d = x - mean;
+    acc += d * d;
   }
-  if (used.length < MIN_SAMPLES) return Z.map((z) => z * sigma * Math.sqrt(H));
-  const sorted = Float64Array.from(used).sort();
-  // The median offset is pinned to 0: persistence is the median forecast.
-  return QUANTILES.map((tau, j) => (j === 2 ? 0 : quantileOf(sorted, tau) * SPREAD_SCALE));
+  return Math.sqrt(acc / xs.length);
 }
 
-function forecastMarket(m: CaseMarket, horizon: number, pool: PoolSrc[] | null, self: Float64Array): number[][] {
-  const p = Float64Array.from(m.prices);
-  const n = p.length;
-  const x = p[n - 1];
-  if (n < MIN_HISTORY) {
-    const rows: number[][] = [];
-    for (let h = 1; h <= horizon; h++) rows.push(Z.map((z) => round6(clamp01(x + z * BASE_SIGMA * Math.sqrt(h)))));
-    return rows;
+/** Square roots of the horizons, computed once and reused by every market and case. */
+const ROOTS: number[] = [0];
+function rootOf(h: number): number {
+  let r = ROOTS[h];
+  if (r === undefined) {
+    r = Math.sqrt(h);
+    ROOTS[h] = r;
   }
-  const firstStart = firstStartOf(n);
-  // Own step volatility (RMS of 1-step changes over the usable window): the
-  // fallback term uses it, and the vol-regime multiplier.
-  const rms = (a: number, b: number): number => {
-    let ss = 0, c = 0;
-    for (let i = a; i < b; i++) { const d = p[i + 1] - p[i]; ss += d * d; c++; }
-    return c ? Math.sqrt(ss / c) : 0;
-  };
-  const sigWin = rms(firstStart, n - 1);
-  let sigma = sigWin;
-  if (!(sigma > 0)) sigma = BASE_SIGMA;
+  return r;
+}
+
+/** Consecutive one-minute changes of a price series. */
+function minuteChanges(prices: number[]): number[] {
+  const out: number[] = [];
+  for (let i = 1; i < prices.length; i++) out.push((prices[i] as number) - (prices[i - 1] as number));
+  return out;
+}
+
+/**
+ * Every standardised move in a window: for each horizon h from 1 to `horizon` and each start
+ * minute t, (price[t + h] - price[t]) / sqrt(h). One sample describing how this market moves
+ * per root-minute, whatever the horizon.
+ */
+function standardisedMoves(prices: number[], horizon: number): number[] {
+  const out: number[] = [];
+  const n = prices.length;
+  const maxH = Math.min(horizon, n - 1);
+  for (let h = 1; h <= maxH; h++) {
+    const root = rootOf(h);
+    for (let t = 0; t + h < n; t++) out.push(((prices[t + h] as number) - (prices[t] as number)) / root);
+  }
+  return out;
+}
+
+interface MarketModel {
+  id: string;
+  last: number;
+  /** Minutes of prices this market's window holds; decides own-sample vs pooled. */
+  minutes: number;
+  /** Sorted standardised moves of the market's own window, in price units per root-minute. */
+  ownSorted: number[];
+  /** Volatility of the market's one-minute changes over its window. */
+  vol: number;
+  /** Clamped ratio of the last hour's volatility to the window's volatility. */
+  regime: number;
+}
+
+/** Build the per-market statistics a forecast is drawn from. */
+function modelMarket(m: CaseMarket, horizon: number): MarketModel {
+  const prices = m.prices.slice(-HISTORY_MINUTES);
+  const moves = standardisedMoves(prices, horizon);
+  moves.sort((a, b) => a - b);
+  const changes = minuteChanges(prices);
+  const vol = stdDev(changes);
+  const recentVol = stdDev(changes.slice(-RECENT_MINUTES));
+  // The regime factor applies only when both volatilities are measurable: a last hour with no
+  // move at all carries no information about the minutes ahead (the price may simply not have
+  // traded), so it leaves the fan at its window width rather than narrowing it.
   let regime = 1;
-  if (sigWin > 0) {
-    const sigShort = rms(Math.max(firstStart, n - 1 - REGIME_MIN), n - 1);
-    regime = Math.min(REGIME_HI, Math.max(REGIME_LO, sigShort / sigWin));
+  if (vol > 0 && recentVol > 0) regime = Math.min(REGIME_CEIL, Math.max(REGIME_FLOOR, recentVol / vol));
+  return {
+    id: m.id,
+    last: prices[prices.length - 1] as number,
+    minutes: prices.length,
+    ownSorted: moves,
+    vol,
+    regime,
+  };
+}
+
+/**
+ * The five quantile offsets (from the median, per root-minute, price units) a model forecasts
+ * with: its own sample when its history is long enough, otherwise the pooled unit-volatility
+ * sample re-scaled by its own volatility.
+ */
+function quantileOffsets(model: MarketModel, pooledSorted: number[] | null): number[] {
+  let sorted: number[] | null = null;
+  let unit = 1;
+  if (model.minutes >= THIN_MINUTES || pooledSorted === null) {
+    sorted = model.ownSorted;
+  } else if (model.vol > 0) {
+    sorted = pooledSorted;
+    unit = model.vol;
+  } else {
+    sorted = model.ownSorted;
   }
-  const gridOff = GRID_H.map((H) => horizonOffsets(p, firstStart, H, sigma, pool, self));
-  const gridSq = GRID_H.map((H) => Math.sqrt(H));
+  if (sorted === null || sorted.length === 0) return QUANTILES.map(() => 0);
+  const centre = sampleQuantile(sorted, 0.5) * unit;
+  return QUANTILES.map((tau, j) => {
+    const raw = sampleQuantile(sorted, tau) * unit - centre;
+    const isOuter = j === 0 || j === QUANTILES.length - 1;
+    return raw * SPREAD_SCALE * (isOuter ? OUTER_SCALE : 1) * model.regime;
+  });
+}
+
+/** One market's forecast: horizon rows of five quantiles fanning out from its last price. */
+function forecastRows(model: MarketModel, offsets: number[], horizon: number): number[][] {
   const rows: number[][] = [];
-  let g = 0;
   for (let h = 1; h <= horizon; h++) {
-    const sq = Math.sqrt(h);
-    while (g < GRID_H.length - 2 && gridSq[g + 1] < sq) g++;
-    const f = (sq - gridSq[g]) / (gridSq[g + 1] - gridSq[g]);
-    const row = gridOff[g].map((v, j) => {
-      const interp = v + (gridOff[g + 1][j] - v) * f;
-      if (j === 2) return interp; // 0 by construction: persistence median
-      const om = j === 0 || j === 4 ? OUTER_SCALE : 1;
-      return interp * regime * om;
-    });
-    // Keep the rows ordered regardless of the multipliers above.
-    const med = row[2];
-    row[0] = Math.min(row[0], row[1], med);
-    row[1] = Math.min(row[1], med);
-    row[3] = Math.max(row[3], med);
-    row[4] = Math.max(row[4], row[3]);
-    rows.push(row.map((off) => round6(clamp01(x + off))));
+    const root = rootOf(h);
+    const row = offsets.map((off) => price6(model.last + off * root));
+    // The median offset is 0 by construction, so the row is already ordered; enforce it anyway
+    // so a clamped row can never come out decreasing.
+    for (let j = 1; j < row.length; j++) if ((row[j] as number) < (row[j - 1] as number)) row[j] = row[j - 1] as number;
+    rows.push(row);
   }
   return rows;
 }
 
 mkdirSync(OUTPUT_DIR, { recursive: true });
+// Every case file, in name order, so two runs write the same bytes.
 const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
 for (const file of inputs) {
   const id = file.slice(0, -'.in'.length);
   const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
   if (c.quantiles.length !== QUANTILES.length || c.quantiles.some((t, j) => t !== QUANTILES[j])) {
-    throw new Error(`${file} asks for quantiles ${JSON.stringify(c.quantiles)}`);
+    throw new Error(`${file} asks for quantiles ${JSON.stringify(c.quantiles)}, not ${JSON.stringify(QUANTILES)}`);
   }
-  const pool: PoolSrc[] = c.markets.map((m) => {
-    const p = Float64Array.from(m.prices);
-    return { p, firstStart: firstStartOf(p.length) };
-  });
-  const forecasts = c.markets.map((m, i) => ({ id: m.id, q: forecastMarket(m, c.horizon_minutes, pool, pool[i].p) }));
+  const horizon = c.horizon_minutes;
+  const models = c.markets.map((m) => modelMarket(m, horizon));
+  // The pooled sample: every market's standardised moves divided by its own volatility, so
+  // markets of different scales can lend each other their move shapes.
+  const pooled: number[] = [];
+  for (const model of models) {
+    if (model.vol <= 0) continue;
+    for (const s of model.ownSorted) pooled.push(s / model.vol);
+  }
+  pooled.sort((a, b) => a - b);
+  const pooledSorted = pooled.length > 0 ? pooled : null;
+  const forecasts = models.map((model) => ({
+    id: model.id,
+    q: forecastRows(model, quantileOffsets(model, pooledSorted), horizon),
+  }));
   writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ forecasts })}\n`);
 }
